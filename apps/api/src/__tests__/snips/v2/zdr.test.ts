@@ -44,6 +44,7 @@ const logIgnoreList = [
   "nuqJobFinish metrics",
   "Starting to update tallies",
   "tally for team",
+  "Finished updating tallies",
 ];
 
 async function getLogs() {
@@ -116,159 +117,172 @@ describeIf(TEST_PRODUCTION)("Zero Data Retention", () => {
       }
     }, 60000);
 
-    it("should clean up a crawl", async () => {
-      const preLogs = await getLogs();
+    it(
+      "should clean up a crawl",
+      async () => {
+        const preLogs = await getLogs();
 
-      let identity = await idmux({
-        name: `zdr/${scope}/crawl`,
-        credits: 10000,
-        flags: {
-          allowZDR: true,
-          ...(scope === "Team-scoped"
-            ? {
-                forceZDR: true,
-              }
-            : {}),
-        },
-      });
+        let identity = await idmux({
+          name: `zdr/${scope}/crawl`,
+          credits: 10000,
+          flags: {
+            allowZDR: true,
+            ...(scope === "Team-scoped"
+              ? {
+                  forceZDR: true,
+                }
+              : {}),
+          },
+        });
 
-      const crawl1 = await crawl(
-        {
-          url: "https://firecrawl.dev",
-          limit: 10,
-          zeroDataRetention: scope === "Request-scoped" ? true : undefined,
-        },
-        identity,
-      );
+        const crawl1 = await crawl(
+          {
+            url: "https://firecrawl.dev",
+            limit: 10,
+            zeroDataRetention: scope === "Request-scoped" ? true : undefined,
+          },
+          identity,
+        );
 
-      const postLogs = (await getLogs()).slice(preLogs.length);
+        const postLogs = (await getLogs()).slice(preLogs.length);
 
-      if (postLogs.length > 0) {
-        console.warn("Logs changed during crawl", postLogs);
-      }
+        if (postLogs.length > 0) {
+          console.warn("Logs changed during crawl", postLogs);
+        }
 
-      expect(postLogs).toHaveLength(0);
+        expect(postLogs).toHaveLength(0);
 
-      // Check the crawls table for the crawl record
-      const { data: crawlData, error: crawlError } = await supabase_service
-        .from("crawls")
-        .select("*")
-        .eq("id", crawl1.id)
-        .limit(1);
+        // wait 20 seconds for crawl finish cron to fire
+        await new Promise(resolve => setTimeout(resolve, 20000));
 
-      expect(crawlError).toBeFalsy();
-      expect(crawlData).toHaveLength(1);
+        // Check the crawls table for the crawl record
+        const { data: crawlData, error: crawlError } = await supabase_service
+          .from("crawls")
+          .select("*")
+          .eq("id", crawl1.id)
+          .limit(1);
 
-      if (crawlData && crawlData.length === 1) {
-        const record = crawlData[0];
-        expect(record.url).not.toContain("://"); // no url stored
-        expect(record.options).toBeNull();
-      }
+        expect(crawlError).toBeFalsy();
+        expect(crawlData).toHaveLength(1);
 
-      // Check the scrapes table for individual scrapes in this crawl
-      const { data: scrapes, error: scrapesError } = await supabase_service
-        .from("scrapes")
-        .select("*")
-        .eq("request_id", crawl1.id);
+        if (crawlData && crawlData.length === 1) {
+          const record = crawlData[0];
+          expect(record.url).not.toContain("://"); // no url stored
+          expect(record.options).toBeNull();
+        }
 
-      expect(scrapesError).toBeFalsy();
-      expect((scrapes ?? []).length).toBeGreaterThanOrEqual(1);
+        // Check the scrapes table for individual scrapes in this crawl
+        const { data: scrapes, error: scrapesError } = await supabase_service
+          .from("scrapes")
+          .select("*")
+          .eq("request_id", crawl1.id);
 
-      for (const scrapeRecord of scrapes ?? []) {
-        expect(scrapeRecord.url).not.toContain("://"); // no url stored
-        expect(scrapeRecord.options).toBeNull();
+        expect(scrapesError).toBeFalsy();
+        expect((scrapes ?? []).length).toBeGreaterThanOrEqual(1);
 
-        if (scrapeRecord.success) {
+        for (const scrapeRecord of scrapes ?? []) {
+          expect(scrapeRecord.url).not.toContain("://"); // no url stored
+          expect(scrapeRecord.options).toBeNull();
+
+          if (scrapeRecord.success) {
+            const gcsJob = await getJobFromGCS(scrapeRecord.id);
+            expect(gcsJob).not.toBeNull(); // clean up happens async on a worker after expiry
+          }
+        }
+
+        await zdrcleaner(identity.teamId!);
+
+        for (const scrapeRecord of scrapes ?? []) {
           const gcsJob = await getJobFromGCS(scrapeRecord.id);
-          expect(gcsJob).not.toBeNull(); // clean up happens async on a worker after expiry
+          expect(gcsJob).toBeNull();
+
+          if (scope === "Request-scoped") {
+            const status = await scrapeStatusRaw(scrapeRecord.id, identity);
+            expect(status.statusCode).toBe(404);
+          }
         }
-      }
+      },
+      600000 + 20000,
+    );
 
-      await zdrcleaner(identity.teamId!);
+    it(
+      "should clean up a batch scrape",
+      async () => {
+        const preLogs = await getLogs();
 
-      for (const scrapeRecord of scrapes ?? []) {
-        const gcsJob = await getJobFromGCS(scrapeRecord.id);
-        expect(gcsJob).toBeNull();
+        let identity = await idmux({
+          name: `zdr/${scope}/batch-scrape`,
+          credits: 10000,
+          flags: {
+            allowZDR: true,
+            ...(scope === "Team-scoped"
+              ? {
+                  forceZDR: true,
+                }
+              : {}),
+          },
+        });
 
-        if (scope === "Request-scoped") {
-          const status = await scrapeStatusRaw(scrapeRecord.id, identity);
-          expect(status.statusCode).toBe(404);
+        const crawl1 = await batchScrape(
+          {
+            urls: ["https://firecrawl.dev", "https://mendable.ai"],
+            zeroDataRetention: scope === "Request-scoped" ? true : undefined,
+          },
+          identity,
+        );
+        const postLogs = (await getLogs()).slice(preLogs.length);
+
+        if (postLogs.length > 0) {
+          console.warn("Logs changed during batch scrape", postLogs);
         }
-      }
-    }, 600000);
 
-    it("should clean up a batch scrape", async () => {
-      const preLogs = await getLogs();
+        expect(postLogs).toHaveLength(0);
 
-      let identity = await idmux({
-        name: `zdr/${scope}/batch-scrape`,
-        credits: 10000,
-        flags: {
-          allowZDR: true,
-          ...(scope === "Team-scoped"
-            ? {
-                forceZDR: true,
-              }
-            : {}),
-        },
-      });
+        // wait 20 seconds for batch scrape finish cron to fire
+        await new Promise(resolve => setTimeout(resolve, 20000));
 
-      const crawl1 = await batchScrape(
-        {
-          urls: ["https://firecrawl.dev", "https://mendable.ai"],
-          zeroDataRetention: scope === "Request-scoped" ? true : undefined,
-        },
-        identity,
-      );
+        // Check the batch_scrapes table for the batch scrape record
+        const { data: batchData, error: batchError } = await supabase_service
+          .from("batch_scrapes")
+          .select("*")
+          .eq("id", crawl1.id)
+          .limit(1);
 
-      const postLogs = (await getLogs()).slice(preLogs.length);
+        expect(batchError).toBeFalsy();
+        expect(batchData).toHaveLength(1);
 
-      if (postLogs.length > 0) {
-        console.warn("Logs changed during batch scrape", postLogs);
-      }
+        // Check the scrapes table for individual scrapes in this batch
+        const { data: scrapes, error: scrapesError } = await supabase_service
+          .from("scrapes")
+          .select("*")
+          .eq("request_id", crawl1.id);
 
-      expect(postLogs).toHaveLength(0);
+        expect(scrapesError).toBeFalsy();
+        expect((scrapes ?? []).length).toBe(2);
 
-      // Check the batch_scrapes table for the batch scrape record
-      const { data: batchData, error: batchError } = await supabase_service
-        .from("batch_scrapes")
-        .select("*")
-        .eq("id", crawl1.id)
-        .limit(1);
+        for (const scrapeRecord of scrapes ?? []) {
+          expect(scrapeRecord.url).not.toContain("://"); // no url stored
+          expect(scrapeRecord.options).toBeNull();
 
-      expect(batchError).toBeFalsy();
-      expect(batchData).toHaveLength(1);
+          if (scrapeRecord.success) {
+            const gcsJob = await getJobFromGCS(scrapeRecord.id);
+            expect(gcsJob).not.toBeNull(); // clean up happens async on a worker after expiry
+          }
+        }
 
-      // Check the scrapes table for individual scrapes in this batch
-      const { data: scrapes, error: scrapesError } = await supabase_service
-        .from("scrapes")
-        .select("*")
-        .eq("request_id", crawl1.id);
+        await zdrcleaner(identity.teamId!);
 
-      expect(scrapesError).toBeFalsy();
-      expect((scrapes ?? []).length).toBe(2);
-
-      for (const scrapeRecord of scrapes ?? []) {
-        expect(scrapeRecord.url).not.toContain("://"); // no url stored
-        expect(scrapeRecord.options).toBeNull();
-
-        if (scrapeRecord.success) {
+        for (const scrapeRecord of scrapes ?? []) {
           const gcsJob = await getJobFromGCS(scrapeRecord.id);
-          expect(gcsJob).not.toBeNull(); // clean up happens async on a worker after expiry
+          expect(gcsJob).toBeNull();
+
+          if (scope === "Request-scoped") {
+            const status = await scrapeStatusRaw(scrapeRecord.id, identity);
+            expect(status.statusCode).toBe(404);
+          }
         }
-      }
-
-      await zdrcleaner(identity.teamId!);
-
-      for (const scrapeRecord of scrapes ?? []) {
-        const gcsJob = await getJobFromGCS(scrapeRecord.id);
-        expect(gcsJob).toBeNull();
-
-        if (scope === "Request-scoped") {
-          const status = await scrapeStatusRaw(scrapeRecord.id, identity);
-          expect(status.statusCode).toBe(404);
-        }
-      }
-    }, 600000);
+      },
+      600000 + 20000,
+    );
   });
 });
